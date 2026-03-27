@@ -360,56 +360,131 @@ def process_image_file(file_path, args, color_rgb, font_path):
 
 def process_pdf_file(file_path, args, color_rgb, font_path):
     """
-    Version simple et robuste :
-    - rend chaque page en image à la résolution choisie
-    - applique le filigrane avec PIL
-    - reconstruit un PDF
-
-    Note honnête : cela rasterise les pages du PDF.
+    Watermark PDF en vectoriel :
+    - texte répété en diagonale directement dans le PDF
+    - logo optionnel inséré sur chaque page
+    - sauvegarde compressée
     """
     src = Path(file_path)
     dst = output_path_for(src, args.output_dir)
 
     doc = fitz.open(src)
-    out_doc = fitz.open()
 
-    zoom = args.dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
+    use_fontfile = font_path if font_path and Path(font_path).exists() else None
 
-    for page_index, page in enumerate(doc, start=1):
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    if use_fontfile:
+        fontname = "F0"  # nom arbitraire, nouveau
+    else:
+        fontname = "helv"  # fallback Helvetica
 
-        watermarked = watermark_pil_image(
-            pil_image=img,
-            text=args.text,
-            logo_path=args.logo,
-            font_path=font_path,
-            font_size=args.font_size,
-            color_rgb=color_rgb,
-            opacity=args.opacity,
-            angle=args.angle,
-            spacing_x=args.spacing_x,
-            spacing_y=args.spacing_y,
-            logo_scale=args.logo_scale,
-            logo_opacity=args.logo_opacity,
-        ).convert("RGB")
+    for page_num, page in enumerate(doc, start=1):
+        rect = page.rect
+        width = rect.width
+        height = rect.height
 
-        buffer = BytesIO()
-        watermarked.save(buffer, format="PNG")
-        buffer.seek(0)
+        fontsize = args.font_size or max(24, int(min(width, height) * 0.055))
 
-        rect = fitz.Rect(0, 0, pix.width, pix.height)
-        new_page = out_doc.new_page(width=pix.width, height=pix.height)
-        new_page.insert_image(rect, stream=buffer.getvalue())
+        text_len = max(1, len(args.text))
+        approx_text_width = fontsize * text_len * 0.55
 
-        print(f"[OK] PDF page {page_index}/{len(doc)} traitée")
+        spacing_x = args.spacing_x or max(int(approx_text_width * 1.4), 220)
+        spacing_y = args.spacing_y or max(int(fontsize * 3.2), 120)
 
-    out_doc.save(dst)
-    out_doc.close()
+        diagonal = math.sqrt(width * width + height * height)
+
+        start_x = -diagonal
+        end_x = width + diagonal
+        start_y = -diagonal
+        end_y = height + diagonal
+
+        y = start_y
+        row_index = 0
+
+        while y < end_y:
+            row_offset = 0 if row_index % 2 == 0 else spacing_x / 2
+            x = start_x
+
+            while x < end_x:
+                insert_point = fitz.Point(x + row_offset, y)
+
+                kwargs = {
+                    "point": insert_point,
+                    "text": args.text,
+                    "fontsize": fontsize,
+                    "rotate": 0,  # important : pas d'angle arbitraire ici
+                    "morph": (insert_point, fitz.Matrix(args.angle)),
+                    "color": tuple(c / 255 for c in color_rgb),
+                    "fill_opacity": max(0.0, min(1.0, args.opacity / 255)),
+                    "overlay": True,
+                    "render_mode": 0,
+                    "fontname": fontname,
+                }
+
+                if use_fontfile:
+                    kwargs["fontfile"] = use_fontfile
+
+                try:
+                    page.insert_text(**kwargs)
+                except TypeError:
+                    # compatibilité versions plus anciennes
+                    kwargs.pop("fill_opacity", None)
+                    page.insert_text(**kwargs)
+
+                x += spacing_x
+
+            y += spacing_y
+            row_index += 1
+
+        if args.logo and Path(args.logo).exists():
+            try:
+                logo_rect_w = max(40, width * args.logo_scale)
+                logo_rect_h = logo_rect_w
+                margin = max(10, width * 0.02)
+
+                positions = [
+                    fitz.Rect(
+                        margin, margin, margin + logo_rect_w, margin + logo_rect_h
+                    ),
+                    fitz.Rect(
+                        width - margin - logo_rect_w,
+                        margin,
+                        width - margin,
+                        margin + logo_rect_h,
+                    ),
+                    fitz.Rect(
+                        margin,
+                        height - margin - logo_rect_h,
+                        margin + logo_rect_w,
+                        height - margin,
+                    ),
+                    fitz.Rect(
+                        width - margin - logo_rect_w,
+                        height - margin - logo_rect_h,
+                        width - margin,
+                        height - margin,
+                    ),
+                ]
+
+                for logo_rect in positions:
+                    page.insert_image(
+                        logo_rect,
+                        filename=args.logo,
+                        overlay=True,
+                    )
+            except Exception as exc:
+                print(f"[WARN] Logo non appliqué sur page {page_num}: {exc}")
+
+        print(f"[OK] PDF page {page_num}/{len(doc)} traitée en vectoriel")
+
+    doc.save(
+        dst,
+        garbage=3,
+        deflate=True,
+        clean=True,
+    )
     doc.close()
 
-    print(f"[OK] PDF filigrané : {dst}")
+    print(f"[OK] PDF filigrané (vectoriel) : {dst}")
 
 
 def list_files_to_process(input_path, recursive=False):
@@ -419,7 +494,9 @@ def list_files_to_process(input_path, recursive=False):
         raise FileNotFoundError(f"Chemin introuvable : {input_path}")
 
     if p.is_file():
-        if p.suffix.lower() in SUPPORTED_EXTENSIONS:
+        if p.suffix.lower() in SUPPORTED_EXTENSIONS and not p.stem.endswith(
+            "_watermarked"
+        ):
             return [p]
         raise ValueError(f"Type de fichier non supporté : {p.suffix}")
 
@@ -427,7 +504,9 @@ def list_files_to_process(input_path, recursive=False):
     files = [
         f
         for f in p.glob(pattern)
-        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+        if f.is_file()
+        and f.suffix.lower() in SUPPORTED_EXTENSIONS
+        and not f.stem.endswith("_watermarked")
     ]
 
     return sorted(files)

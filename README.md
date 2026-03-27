@@ -109,6 +109,8 @@ python3 filigranneur.py "INTERNE - 20260327" \
   --output-dir "output/" \
   --opacity 50 \
   --font-path "/Users/username/Library/Fonts/BebasNeue-Regular.ttf"
+  --spacing-x 160 \
+  --spacing-y 240
 ```
 
 ---
